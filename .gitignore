@@ -1,0 +1,7 @@
+# Miscellaneous
+.DS_Store
+.vstags
+.vscode/
+.gitattributes
+.meta.json
+.git/

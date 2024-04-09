@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+#
+# mf - MySQL Formatter
+#
+# Executes a select query against a remote MySQL database and captures the
+# results for local processing and automation. The query results are printed
+# to stdout as a tab-delimited list of values. The first row of the output
+# contains the column names, unless the --no-header option is specified.
+#
+# The select-verb may be omitted in the query as it is automatically added
+# by this script if it is not present. The query should be enclosed in double
+# quotes. You cannot use anything but a query with this script, since it will
+# prevent the accidental use of write operations.
+#
+# Usage:
+#	[DB_HOST=<host>] mf <sql-select-query>
+#	mf [<host>] <sql-select-query>
+#	mf [<options>] -H|--host=<host> [<options>] [--] <select-query>
+#
+# Options:
+# 	-H, --host <host>
+# 		The remote host to connect to (defaults to $DB_HOST).
+# 	-D, --database <name>
+# 		The database to connect to (defaults to $DB_NAME or 'vz').
+# 	--[no-]header
+# 		Exclude or include the header row in the output. Included by default.
+# 	-i, --iso8601
+# 		Make date and time fields ISO-8601-compliant (YYYY-MM-DDTHH:MM:SS).
+# 	-c, --csv[=0,1|2|"'"|'"']
+# 		Output in CSV format. If 2 then use double quotes (default), if 1 then
+# 		use single quotes, if 0 then leave it as tab-separated values. If you
+# 		do not specify a value, then be sure to separate the option from the
+# 		query with a double dash (--) so that the query isn't used as the
+#		delimiter :-).
+# 	-b, --brackets ["square" | "round" | "braced" | "[]" | "()" | "{}"]
+# 		Enclose the values in brackets. Default is round brackets. Only applies
+# 		to CSV output.
+# 	-t, --table
+# 		Output in tidy, tab-delimited table.
+# 	-X, --xml
+# 		Output in XML format.
+# 	-J, --json
+# 		Output in JSON format. Requires yq and jq.
+# 	-C, --json-csv
+# 		Output in JSON format, then convert to CSV. For fields containing 
+# 		binary data (e.g. server.ip6internal), this might be a better choice
+# 		than --table and --csv because the binary data conversion is handled
+# 		in a more robust way. The --json is implied, so no need to use it.
+# 	-T, --json-tsv
+# 		Output in JSON format, then convert to TSV. For fields containing 
+# 		binary data (e.g. server.ip6internal), this might be a better choice
+# 		than --table and --csv because the binary data conversion is handled
+# 		in a more robust way. The --json is implied, so no need to use it.
+# 	-h, --help
+# 		Display the help and exit.
+
+set -u -f -o noglob -o pipefail
+set -- $(getoptions -B -f -o 'h|help,D|database:?b|brackets:?J|json,T|json-tsv,C|json-csv,X|xml,t|table,H|host:header!i|iso8601!c|csv:?' -- "$@")
+
+header=true
+brackets=
+json=false
+jtsv=false
+jcsv=false
+csv=
+iso8601=false
+db_host=${DB_HOST:-${db_host:-}}
+db_name=${DB_NAME:-${db_name:-vz}}
+batch="-t"
+while [[ $# && ${1:0:1} == "-" ]]; do
+	case $1 in
+		--host)
+			db_host=$2
+			shift 2
+			;;
+		--database)
+			db_name=$2
+			shift 2
+			;;
+		--brackets)
+			shift
+			brackets=$1
+			shift 
+			;;
+		--header)
+			header=${2:-true}
+			shift 2
+			;;
+		--iso8601)
+			iso8601=${2:-true}
+			shift 2
+			;;
+		--csv)
+			batch="-B"
+			csv=$2
+			[[ $csv == "-" ]] && csv=2
+			[[ $csv == '\"' ]] && csv=2
+			[[ $csv == "\'" ]] && csv=1
+			shift 2
+			;;
+		--table)
+			csv=
+			batch="-B"
+			shift
+			;;
+		--xml)
+			csv=
+			batch="-X"
+			shift
+			;;
+		--json)
+			which yq > /dev/null || {
+				echo "yq is required for JSON output" >&2
+				echo "try 'brew install yq'"
+				exit 1
+			}
+			which jq > /dev/null || {
+				echo "jq is required for JSON output" >&2
+				echo "try 'brew install jq', or visit https://stedolan.github.io/jq/download/" >&2
+				exit 1
+			}
+			json=true
+			batch="-X"
+			shift
+			;;
+		--json-tsv)
+			which yq > /dev/null || {
+				echo "yq is required for JSON output" >&2
+				echo "try 'brew install yq'"
+				exit 1
+			}
+			which jq > /dev/null || {
+				echo "jq is required for JSON output" >&2
+				echo "try 'brew install jq', or visit https://stedolan.github.io/jq/download/" >&2
+				exit 1
+			}
+			json=true
+			batch="-X"
+			jtsv=true
+			shift
+			;;
+		--json-csv)
+			which yq > /dev/null || {
+				echo "yq is required for JSON output" >&2
+				echo "try 'brew install yq'"
+				exit 1
+			}
+			which jq > /dev/null || {
+				echo "jq is required for JSON output" >&2
+				echo "try 'brew install jq', or visit https://stedolan.github.io/jq/download/" >&2
+				exit 1
+			}
+			json=true
+			batch="-X"
+			jcsv=true
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-?|--help)
+			cat >&2 <<EOF
+mf - MySQL Formatter
+
+USAGE
+	[DB_HOST=<host>] mf <select-query>
+	mf [<host>] <select-query>
+	mf [<options>] -h|--host=<host> [<options>] [--] <select-query>
+
+OPTIONS
+	-H, --host <host>
+		The remote host to connect to (defaults to \$DB_HOST).
+
+ 	-D, --database <name>
+ 		The database to connect to (defaults to \$DB_NAME or 'vz').
+
+	--[no-]header
+		Exclude or include the header row in the output. Included by default.
+
+	-i, --iso8601
+		Make date and time fields ISO-8601-compliant (YYYY-MM-DDTHH:MM:SS).
+	
+	-c, --csv[=0,1|2|"'"|'"']
+		Output in CSV format. If 2 then use double quotes (default), if 1 then
+		use single quotes, if 0 then leave it as tab-separated values.  If you
+		do not specify a value, then be sure to separate the option from the
+ 		query with a double dash (--) so that the query isn't used as the
+		delimiter :-).
+
+	-b, --brackets ["square" | "round" | "braced" | "[]" | "()" | "{}"]
+		Enclose the values in brackets. Default is round brackets. Only applies
+		to CSV output.
+
+	-t, --table
+		Output in tidy, tab-delimited table.
+	
+	-X, --xml
+		Output in XML format.
+	
+	-J, --json
+		Output in JSON format. Requires yq and jq.
+	
+	-C, --json-csv
+		Output in JSON format, then convert to CSV. For fields containing 
+		binary data (e.g. server.ip6internal), this might be a better choice
+		than --table and --csv because the binary data conversion is handled
+		in a more robust way. The --json is implied, so no need to use it.
+
+	-T, --json-tsv
+		Output in JSON format, then convert to TSV. For fields containing 
+		binary data (e.g. server.ip6internal), this might be a better choice
+		than --table and --csv because the binary data conversion is handled
+		in a more robust way. The --json is implied, so no need to use it.
+
+	-h, --help
+		Display the help and exit.
+EOF
+			exit 1
+			;;
+	esac
+done
+
+if [[ -z $db_host ]]; then
+	db_host=$1
+	shift
+fi
+
+if [[ -z $db_name ]]; then
+	echo "Database name is required" >&2
+	exit 1
+fi
+
+db_query="$@"
+shift $#
+
+if [[ -z $db_query ]]; then
+	if [[ -n $db_host ]]; then
+		"$0" --help
+		exit 1
+	fi
+fi
+
+if [[ -n $db_host ]] && [[ -n $db_query ]]; then
+	db_query="${db_query#\"}"
+	db_query="${db_query%\"}"
+	if [[ ! ${db_query,,} =~ ^select[[:blank:]] ]]; then
+		db_query="SELECT $db_query"
+	fi
+	db_query="SET SESSION TRANSACTION READ ONLY; SET autocommit=0; START TRANSACTION READ ONLY; ${db_query}; ROLLBACK;"
+	ssh -T -o StrictHostKeyChecking=no "$db_host" <<< "sudo mysql --binary-as-hex -D$db_name $batch -e \"$db_query\"" > /tmp/vzselect.$$.1
+else
+	cat > /tmp/vzselect.$$.1
+fi
+
+LC_CTYPE=C; LANG=C
+
+if [[ ${iso8601:-} == true ]]; then
+	sed -Ee 's/([[:digit:]]{4}-[[:digit:]]{2}-[[:digit:]]{2})[[:space:]]+([[:digit:]]{2}:[[:digit:]]{2}:[[:digit:]]{2})/\1T\2/g' /tmp/vzselect.$$.1 > /tmp/vzselect.$$.2
+	mv -f /tmp/vzselect.$$.2 /tmp/vzselect.$$.1
+fi
+
+if [[ ${batch:-} == "-B" ]]; then
+	if [[ ! $header == true ]]; then
+		tail -n +2 /tmp/vzselect.$$.1 > /tmp/vzselect.$$.2
+		mv -f /tmp/vzselect.$$.2 /tmp/vzselect.$$.1
+	fi
+	if [[ -n $csv ]]; then
+		if [[ $csv == "2" ]]; then
+			sed -Ee 's/^/"/; s/\t/","/g; s/$/"/; s/"NULL"//g; s/"0x"//g; s/"0x([[:xdigit:]]+)"/0x\1/g' /tmp/vzselect.$$.1 > /tmp/vzselect.$$.2
+		elif [[ $csv == "1" ]]; then
+			sed -Ee "s/^/'/; s/\t/','/g; s/$/'/; s/'NULL'//g; s/'0x'//g; s/'0x([[:xdigit:]]+)'/0x\1/g" /tmp/vzselect.$$.1 > /tmp/vzselect.$$.2
+		fi
+		if [[ -n $brackets ]]; then
+			if [[ $brackets == "square" ]] || [[ $brackets == '[]' ]]; then
+				awk '{print "[" $0 "]"}' /tmp/vzselect.$$.2 > /tmp/vzselect.$$.1
+			elif [[ $brackets == "round" ]] || [[ $brackets == '()' ]]; then
+				awk '{print "(" $0 ")"}' /tmp/vzselect.$$.2 > /tmp/vzselect.$$.1
+			elif [[ $brackets == "braced" ]] || [[ $brackets == '{}' ]]; then
+				awk '{print "{" $0 "}"}' /tmp/vzselect.$$.2 > /tmp/vzselect.$$.1
+			else
+				awk '{print "(" $0 ")"}' /tmp/vzselect.$$.2 > /tmp/vzselect.$$.1
+			fi
+		else
+			mv -f /tmp/vzselect.$$.2 /tmp/vzselect.$$.1
+		fi
+		cat /tmp/vzselect.$$.1
+	else
+		sed -Ee 's/\t\t/\t-\t/g; s/NULL/-/g; s/0x\t/-\t/g;' /tmp/vzselect.$$.1 | column -t -s $'\t'
+	fi
+elif [[ ${batch:-} == "-X" ]]; then
+	if [[ ${json:-} == true ]]; then
+		if [[ $jtsv == true ]]; then
+			yq -p=xml -o=json /tmp/vzselect.$$.1 | sed -Ee '/p_xml|xmlns:xsi/d; s/\"\+\@?/\"/g; s/"xsi:nil": "true"/"content": "-"/g;' > /tmp/vzselect.$$.2
+			if [[ $header == true ]]; then
+				jq -r '.resultset.row | if type=="array" then .[0] else . end | [ .field[] | [ .name ]    | add ] | @tsv' < /tmp/vzselect.$$.2
+				jq -r '.resultset.row | if type=="array" then .[]  else . end | [ .field[] | [ .content ] | add ] | @tsv' < /tmp/vzselect.$$.2 |
+					sed -Ee 's/\t\t/\t-\t/g'
+			else
+				jq -r '.resultset.row | if type=="array" then .[]  else . end | [ .field[] | [ .content ] | add ] | @tsv' < /tmp/vzselect.$$.2 |
+					sed -Ee 's/\t\t/\t-\t/g'
+			fi
+		elif [[ $jcsv == true ]]; then
+			yq -p=xml -o=json /tmp/vzselect.$$.1 | sed -Ee '/p_xml|xmlns:xsi/d; s/\"\+\@?/\"/g; s/"xsi:nil": "true"/"content": null/g;' > /tmp/vzselect.$$.2
+			if [[ $header == true ]]; then
+				jq -r '.resultset.row | if type=="array" then .[0] else . end | [ .field[] | [ .name ]    | add ] | @csv' < /tmp/vzselect.$$.2 > /tmp/vzselect.$$.1
+				jq -r '.resultset.row | if type=="array" then .[]  else . end | [ .field[] | [ .content ] | add ] | @csv' < /tmp/vzselect.$$.2 >> /tmp/vzselect.$$.1
+			else
+				jq -r '.resultset.row | if type=="array" then .[]  else . end | [ .field[] | [ .content ] | add ] | @csv' < /tmp/vzselect.$$.2 > /tmp/vzselect.$$.1
+			fi
+			if [[ -n $brackets ]]; then
+				if [[ $brackets == "square" ]] || [[ $brackets == '[]' ]]; then
+					awk '{print "[" $0 "]"}' /tmp/vzselect.$$.1 | sed -Ee 's/"0x([[:xdigit:]]+)"/0x\1/g'
+				elif [[ $brackets == "round" ]] || [[ $brackets == '()' ]]; then
+					awk '{print "(" $0 ")"}' /tmp/vzselect.$$.1 | sed -Ee 's/"0x([[:xdigit:]]+)"/0x\1/g'
+				elif [[ $brackets == "braced" ]] || [[ $brackets == '{}' ]]; then
+					awk '{print "{" $0 "}"}' /tmp/vzselect.$$.1 | sed -Ee 's/"0x([[:xdigit:]]+)"/0x\1/g'
+				else
+					awk '{print "(" $0 ")"}' /tmp/vzselect.$$.1 | sed -Ee 's/"0x([[:xdigit:]]+)"/0x\1/g'
+				fi
+			else
+				sed -Ee 's/"0x([[:xdigit:]]+)"/0x\1/g' /tmp/vzselect.$$.1
+			fi
+		else
+			yq -p=xml -o=json /tmp/vzselect.$$.1 | sed -Ee '/p_xml|xmlns:xsi/d; s/\"\+\@?/\"/g; s/"xsi:nil": "true"/"content": null/g' > /tmp/vzselect.$$.2
+			jq -r '[ .resultset.row | if type=="array" then .[] else . end | [ .field[] | { (.name): .content } ] | add ]' < /tmp/vzselect.$$.2
+		fi
+	else
+		cat /tmp/vzselect.$$.1
+	fi
+else
+	if [[ $header == true ]]; then
+		sed -Ee 's/0x[[:space:]]{2}/NULL/g;' /tmp/vzselect.$$.1
+	else
+		sed -Ee 's/0x[[:space:]]{2}/NULL/g;' /tmp/vzselect.$$.1 | tail -n +3
+	fi
+fi
+
+rm -f /tmp/vzselect.$$.[12]
